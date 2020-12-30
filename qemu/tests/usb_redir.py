@@ -4,6 +4,7 @@ import os
 
 from virttest import error_context
 from virttest import utils_misc
+from virttest import utils_package
 from virttest import env_process
 from virttest.qemu_devices import qdevices
 from virttest.utils_params import Params
@@ -19,15 +20,26 @@ def run(test, params, env):
     Test usb redirection
 
     1) Check host configurations
-    2) Preprocess VM
-    3) Start USB redirection via spice (optional)
-    4) Check the boot menu list (optional)
-    5) Check the redirected USB device in guest
+    2) Start usbredirserver on host (optional)
+    3) Preprocess VM
+    4) Start USB redirection via spice (optional)
+    5) Check the boot menu list (optional)
+    6) Check the redirected USB device in guest
 
     :param test: QEMU test object
     :param params: Dictionary with test parameters
     :param env: Dictionary with test environment.
     """
+    def _start_usbredir_server():
+        process.getoutput("killall usbredirserver")
+        usbredir_server = utils_misc.get_binary('usbredirserver', params)
+        usbredirserver_args = usbredir_server + " -p %s " % free_port
+        usbredirserver_args += " %s:%s" % (vendorid, productid)
+        usbredirserver_args += " > /dev/null 2>&1"
+        rv_thread = utils_misc.InterruptedThread(os.system,
+                                                 (usbredirserver_args,))
+        rv_thread.start()
+
     def _host_config_check():
         status = True
         err_msg = ''
@@ -72,6 +84,31 @@ def run(test, params, env):
                 err_msg = "Fail to install 'virt-viewer' on host, "
                 err_msg += "output: %s" % o
                 return (status, err_msg)
+        elif backend == 'tcp_socket':
+            if not utils_package.package_install("usbredir"):
+                status = False
+                err_msg = "Fail to install 'usbredir' on host"
+                return (status, err_msg)
+            usbredirserver_query = "rpm -q usbredir-server"
+            s, o = process.getstatusoutput(usbredirserver_query, shell=True)
+            if s:
+                usbredir_query = "rpm -q usbredir"
+                usbredir_ver = process.getoutput(usbredir_query, shell=True)
+                (build, arch) = usbredir_ver.rsplit(".", 1)
+                brew_cmd = "brew download-build --arch=%s %s" % (arch, build)
+                s, o = process.getstatusoutput(brew_cmd, shell=True)
+                if s:
+                    status = False
+                    err_msg = "Fail to download build '%s', " % build
+                    err_msg += "output: %s" % o
+                    return (status, err_msg)
+                usbredirserver_cmd = "rpm -i usbredir-server*"
+                s, o = process.getstatusoutput(usbredirserver_cmd, shell=True)
+                if s:
+                    status = False
+                    err_msg = "Fail to install 'usbredir-server' on host, "
+                    err_msg += "output: %s" % o
+                    return (status, err_msg)
         return (status, err_msg)
 
     def _usbredir_preprocess():
@@ -84,6 +121,11 @@ def run(test, params, env):
             if backend == 'spicevmc':
                 chardev_params['debug'] = usbredir_params.get('chardev_debug')
                 chardev_params['name'] = usbredir_params.get('chardev_name')
+            else:
+                chardev_params['host'] = usbredir_params['chardev_host']
+                chardev_params['port'] = free_port
+                chardev_params['server'] = usbredir_params.get('chardev_server')
+                chardev_params['nowait'] = usbredir_params.get('chardev_nowait')
             chardev = qdevices.CharDevice(chardev_params, chardev_id)
             usbredir_dev = qdevices.QDevice('usb-redir',
                                             aobject=usbredirdev_name)
@@ -203,11 +245,16 @@ def run(test, params, env):
     if not s:
         test.error(o)
 
+    if backend == 'tcp_socket':
+        free_port = utils_misc.find_free_port()
+        _start_usbredir_server()
+
+    error_context.context("Preprocess VM", logging.info)
+    _usbredir_preprocess()
+    vm = env.get_vm(params["main_vm"])
+    vm.verify_alive()
+
     if backend == 'spicevmc':
-        error_context.context("Preprocess VM", logging.info)
-        _usbredir_preprocess()
-        vm = env.get_vm(params["main_vm"])
-        vm.verify_alive()
         error_context.context("Start USB redirection via spice", logging.info)
         s, o = _start_spice_redirection()
         if not s:
@@ -258,6 +305,8 @@ def run(test, params, env):
         return
 
     if not _usb_dev_verify():
+        if backend == 'tcp_socket':
+            process.getoutput("killall usbredirserver")
         test.fail("Can not find the redirected USB device in guest")
 
     if usb_stick:
@@ -269,5 +318,8 @@ def run(test, params, env):
         finally:
             if iozone_test:
                 iozone_test.clean()
+
+    if backend == 'tcp_socket':
+        process.getoutput("killall usbredirserver")
 
     session.close()
